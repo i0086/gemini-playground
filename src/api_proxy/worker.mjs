@@ -114,9 +114,9 @@ async function handleAudioGenerate (req, apiKey) {
     }
   }
 
-  // 2) 输出格式与语音
+  // 2) 输出格式与语音（仅用于响应头；请求体不设置 responseMimeType）
   var format = (req.audio && req.audio.format ? String(req.audio.format) : "mp3").toLowerCase();
-  var mime = format === "mp3" ? "audio/mpeg" : ("audio/" + format);
+  var defaultMime = format === "mp3" ? "audio/mpeg" : ("audio/" + format);
   var voiceName = "Kore";
   if (req.voice) {
     if (req.voice.voiceName) { voiceName = String(req.voice.voiceName); }
@@ -129,7 +129,7 @@ async function handleAudioGenerate (req, apiKey) {
   var system_instruction;
   var contents;
   if (Array.isArray(req.messages)) {
-	transformed = await transformMessages(req.messages);
+    transformed = await transformMessages(req.messages);
     system_instruction = transformed && transformed.system_instruction;
     contents = transformed && transformed.contents;
   } else {
@@ -137,24 +137,22 @@ async function handleAudioGenerate (req, apiKey) {
     if (!prompt) {
       throw new HttpError("prompt or messages is required", 400);
     }
-	contents = [{ parts: [{ text: prompt }] }];
+    contents = [{ role: "user", parts: [{ text: prompt }] }];
   }
 
-// 最小 TTS 形态，参考你项目里 util/g_voice.py 的成功示例
-	var payload = {
-	  contents: contents,
-	  generationConfig: {
-	    responseModalities: ["AUDIO"],
-	    speechConfig: {
-	      voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName } }
-	    }
-	  }
-	};
-	// system 指令可选添加，不强制
-	if (system_instruction) {
-	  payload.system_instruction = system_instruction;
-	}
-// 不要添加 safetySettings、不要 merge transformConfig(req)
+  // 4) 最小 TTS 请求体（不要合并 transformConfig，不要设置 responseMimeType，不加 safetySettings）
+  var payload = {
+    contents: contents,
+    generationConfig: {
+      responseModalities: ["AUDIO"],
+      speechConfig: {
+        voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName } }
+      }
+    }
+  };
+  if (system_instruction) {
+    payload.system_instruction = system_instruction;
+  }
 
   var url = BASE_URL + "/" + API_VERSION + "/models/" + model + ":generateContent";
   var response = await fetch(url, {
@@ -164,28 +162,40 @@ async function handleAudioGenerate (req, apiKey) {
   });
 
   if (!response.ok) {
-    // 直接转发错误文本
     return new Response(await response.text(), fixCors(response));
   }
 
-  // 4) 提取音频 inlineData（不使用可选链）
+  // 5) 解析响应并提取音频 inlineData
   var textBody = await response.text();
   var js;
   try { js = JSON.parse(textBody); } catch (e) {
-    // 返回原始内容帮助诊断
     return new Response(textBody, fixCors({ headers: { "Content-Type": "application/json" }, status: 200 }));
   }
+
+  // 若上游带 error，按非 2xx 返回，便于客户端识别
+  if (js && js.error) {
+    try { console.error("Audio upstream error:", js.error); } catch (e) {}
+    var status = Number(js.error.code) || 400;
+    return new Response(JSON.stringify(js), fixCors({
+      headers: { "Content-Type": "application/json" },
+      status
+    }));
+  }
+
   var parts = [];
   try {
     if (js && js.candidates && js.candidates[0] && js.candidates[0].content && js.candidates[0].content.parts) {
       parts = js.candidates[0].content.parts;
+      try {
+        console.error("AudioGenerate parts:", JSON.stringify(parts).slice(0, 800));
+      } catch (e) {}
     }
   } catch (e) { parts = []; }
 
   var audioPart = null;
   for (var i = 0; i < parts.length; i++) {
     var p = parts[i];
-    if (p && p.inlineData && p.inlineData.mimeType) {
+    if (p && p.inlineData && p.inlineData.mimeType && p.inlineData.data) {
       var mt = String(p.inlineData.mimeType);
       if (mt.indexOf("audio/") === 0) {
         audioPart = p;
@@ -195,13 +205,13 @@ async function handleAudioGenerate (req, apiKey) {
   }
 
   if (!audioPart) {
-    // 可选：返回 JSON，帮助排查为何没有音频
-    return new Response(JSON.stringify(js), fixCors({ headers: { "Content-Type": "application/json" }, status: 200 }));
+    // 返回 502 + 原始 JSON，帮助定位为何没有音频
+    return new Response(JSON.stringify(js), fixCors({ headers: { "Content-Type": "application/json" }, status: 502 }));
   }
 
-  // 5) 返回音频（默认二进制；支持可选 JSON base64 返回）
-  var dataB64 = audioPart.inlineData && audioPart.inlineData.data ? String(audioPart.inlineData.data) : "";
-  var audioMime = audioPart.inlineData && audioPart.inlineData.mimeType ? String(audioPart.inlineData.mimeType) : mime;
+  // 6) 返回音频（默认二进制；也支持 JSON base64）
+  var dataB64 = String(audioPart.inlineData.data || "");
+  var audioMime = String(audioPart.inlineData.mimeType || defaultMime);
 
   if (req && (req.return_json === true || req.return === "json")) {
     var out = { mimeType: audioMime, data: dataB64, model: model };
