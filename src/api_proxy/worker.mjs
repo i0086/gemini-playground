@@ -35,10 +35,10 @@ export default {
           assert(request.method === "GET");
           return handleModels(apiKey)
             .catch(errHandler);
-				case pathname.endsWith("/audio/generate"):
-				  assert(request.method === "POST");
-				  return handleAudioGenerate(await request.json(), apiKey)
-				    .catch(errHandler);
+		case pathname.endsWith("/audio/generate"):
+		  assert(request.method === "POST");
+		  return handleAudioGenerate(await request.json(), apiKey)
+			.catch(errHandler);
         default:
           throw new HttpError("404 Not Found", 404);
       }
