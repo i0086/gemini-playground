@@ -35,10 +35,10 @@ export default {
           assert(request.method === "GET");
           return handleModels(apiKey)
             .catch(errHandler);
-		case pathname.endsWith("/audio/generate"):
-		  assert(request.method === "POST");
-		  return handleAudioGenerate(await request.json(), apiKey)
-			.catch(errHandler);
+        case pathname.endsWith("/audio/speech"):
+          assert(request.method === "POST");
+          return handleAudioSpeech(await request.json(), apiKey)
+            .catch(errHandler);
         default:
           throw new HttpError("404 Not Found", 404);
       }
@@ -103,123 +103,189 @@ async function handleModels (apiKey) {
   return new Response(body, fixCors(response));
 }
 
-async function handleAudioGenerate (req, apiKey) {
-  // 1) 选择模型（默认 TTS）
-  var model = "gemini-2.5-flash-preview-tts";
-  if (typeof req.model === "string") {
-    if (req.model.indexOf("models/") === 0) {
-      model = req.model.substring(7);
-    } else if (req.model.indexOf("gemini-") === 0 || req.model.indexOf("learnlm-") === 0) {
-      model = req.model;
-    }
+const VOICE_MAPPING = {
+  "alloy": "Aoede",
+  "echo": "Charon",
+  "fable": "Fenrir",
+  "onyx": "Puck",
+  "nova": "Leda",
+  "shimmer": "Callirrhoe"
+};
+
+const RESPONSE_FORMAT_MAPPING = {
+  "mp3": "MP3",
+  "opus": "OGG_OPUS",
+  "aac": "AAC",
+  "flac": "FLAC",
+  "wav": "WAV",
+  "pcm": "PCM"
+};
+
+async function handleAudioSpeech (req, apiKey) {
+  if (!req.input || typeof req.input !== "string") {
+    throw new HttpError("input is required and must be a string", 400);
+  }
+  
+  if (!req.model || typeof req.model !== "string") {
+    throw new HttpError("model is required and must be a string", 400);
   }
 
-  // 2) 输出格式与语音（仅用于响应头；请求体不设置 responseMimeType）
-  var format = (req.audio && req.audio.format ? String(req.audio.format) : "mp3").toLowerCase();
-  var defaultMime = format === "mp3" ? "audio/mpeg" : ("audio/" + format);
-  var voiceName = "Kore";
-  if (req.voice) {
-    if (req.voice.voiceName) { voiceName = String(req.voice.voiceName); }
-    else if (req.voice.name) { voiceName = String(req.voice.name); }
-    else if (req.voice.prebuiltVoice) { voiceName = String(req.voice.prebuiltVoice); }
+  const voice = req.voice || "alloy";
+  const responseFormat = req.response_format || "wav";
+  const speed = req.speed || 1.0;
+
+  if (!VOICE_MAPPING[voice]) {
+    throw new HttpError(`Unsupported voice: ${voice}. Supported voices: ${Object.keys(VOICE_MAPPING).join(", ")}`, 400);
   }
 
-  // 3) 构造内容：优先 messages，否则使用 prompt
-  var transformed = null;
-  var system_instruction;
-  var contents;
-  if (Array.isArray(req.messages)) {
-    transformed = await transformMessages(req.messages);
-    system_instruction = transformed && transformed.system_instruction;
-    contents = transformed && transformed.contents;
-  } else {
-    var prompt = (req.prompt || "").toString();
-    if (!prompt) {
-      throw new HttpError("prompt or messages is required", 400);
-    }
-    contents = [{ role: "user", parts: [{ text: prompt }] }];
+  if (!RESPONSE_FORMAT_MAPPING[responseFormat]) {
+    throw new HttpError(`Unsupported response_format: ${responseFormat}. Supported formats: ${Object.keys(RESPONSE_FORMAT_MAPPING).join(", ")}`, 400);
   }
 
-  // 4) 最小 TTS 请求体（不要合并 transformConfig，不要设置 responseMimeType，不加 safetySettings）
-  var payload = {
-    contents: contents,
-    generationConfig: {
-      responseModalities: ["AUDIO"],
-      speechConfig: {
-        voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName } }
+  if (speed < 0.25 || speed > 4.0) {
+    throw new HttpError("speed must be between 0.25 and 4.0", 400);
+  }
+
+  let model = "gemini-2.5-flash-preview-tts";
+  
+  if (req.model === "tts-1") {
+    model = "gemini-2.5-flash-preview-tts";
+  } else if (req.model === "tts-1-hd") {
+    model = "gemini-2.5-pro-preview-tts";
+  } else if (req.model.startsWith("models/")) {
+    model = req.model.substring(7);
+  } else if (req.model.startsWith("gemini-") || req.model.startsWith("learnlm-")) {
+    model = req.model;
+  }
+
+  const geminiRequest = {
+    contents: [{
+      parts: [{
+        text: req.input
+      }]
+    }],
+    generation_config: {
+      response_modalities: ["AUDIO"],
+      speech_config: {
+        voice_config: {
+          prebuilt_voice_config: {
+            voice_name: VOICE_MAPPING[voice]
+          }
+        }
       }
     }
   };
-  if (system_instruction) {
-    payload.system_instruction = system_instruction;
-  }
 
-  var url = BASE_URL + "/" + API_VERSION + "/models/" + model + ":generateContent";
-  var response = await fetch(url, {
+  const response = await fetch(`${BASE_URL}/${API_VERSION}/models/${model}:generateContent`, {
     method: "POST",
     headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
-    body: JSON.stringify(payload),
+    body: JSON.stringify(geminiRequest)
   });
 
   if (!response.ok) {
-    return new Response(await response.text(), fixCors(response));
+    const errorText = await response.text();
+    
+    if (errorText.includes("does not support requested modality: AUDIO")) {
+      throw new HttpError(`Model '${model}' does not support audio generation. Try using a TTS-capable model.`, response.status);
+    }
+    
+    throw new HttpError(`Gemini API error: ${errorText}`, response.status);
   }
 
-  // 5) 解析响应并提取音频 inlineData
-  var textBody = await response.text();
-  var js;
-  try { js = JSON.parse(textBody); } catch (e) {
-    return new Response(textBody, fixCors({ headers: { "Content-Type": "application/json" }, status: 200 }));
+  const geminiResponse = await response.json();
+
+  if (!geminiResponse.candidates || !geminiResponse.candidates[0] ||
+      !geminiResponse.candidates[0].content || !geminiResponse.candidates[0].content.parts) {
+    throw new HttpError("No audio data received from Gemini API", 500);
   }
 
-  // 若上游带 error，按非 2xx 返回，便于客户端识别
-  if (js && js.error) {
-    try { console.error("Audio upstream error:", js.error); } catch (e) {}
-    var status = Number(js.error.code) || 400;
-    return new Response(JSON.stringify(js), fixCors({
-      headers: { "Content-Type": "application/json" },
-      status
+  let audioData = null;
+  let originalMimeType = null;
+  
+  for (const part of geminiResponse.candidates[0].content.parts) {
+    if (part.inlineData && part.inlineData.mimeType && part.inlineData.mimeType.startsWith('audio/')) {
+      audioData = part.inlineData.data;
+      originalMimeType = part.inlineData.mimeType;
+      break;
+    }
+  }
+
+  if (!audioData) {
+    const textParts = geminiResponse.candidates[0].content.parts.filter(part => part.text);
+    if (textParts.length > 0) {
+      throw new HttpError("Gemini API returned text instead of audio. The model may not support audio generation.", 400);
+    }
+    throw new HttpError("No audio data found in Gemini response", 500);
+  }
+
+  const audioBuffer = Buffer.from(audioData, 'base64');
+  
+  let mimeType;
+  if (originalMimeType) {
+    mimeType = originalMimeType;
+  } else {
+    mimeType = responseFormat === 'mp3' ? 'audio/mpeg' :
+               responseFormat === 'opus' ? 'audio/ogg' :
+               responseFormat === 'aac' ? 'audio/aac' :
+               responseFormat === 'flac' ? 'audio/flac' :
+               responseFormat === 'wav' ? 'audio/wav' :
+               'audio/pcm';
+  }
+
+  if (originalMimeType && (originalMimeType.includes('audio/L16') || originalMimeType === 'audio/pcm')) {
+    let sampleRate = 24000;
+    let bitsPerSample = 16;
+    
+    const rateMatch = originalMimeType.match(/rate=(\d+)/);
+    if (rateMatch) {
+      sampleRate = parseInt(rateMatch[1]);
+    }
+    
+    const wavBuffer = createWavHeader(audioBuffer, sampleRate, 1, bitsPerSample);
+    return new Response(wavBuffer, fixCors({
+      status: 200,
+      headers: {
+        'Content-Type': 'audio/wav',
+        'Content-Length': wavBuffer.length.toString()
+      }
     }));
   }
 
-  var parts = [];
-  try {
-    if (js && js.candidates && js.candidates[0] && js.candidates[0].content && js.candidates[0].content.parts) {
-      parts = js.candidates[0].content.parts;
-      try {
-        console.error("AudioGenerate parts:", JSON.stringify(parts).slice(0, 800));
-      } catch (e) {}
+  return new Response(audioBuffer, fixCors({
+    status: 200,
+    headers: {
+      'Content-Type': mimeType,
+      'Content-Length': audioBuffer.length.toString()
     }
-  } catch (e) { parts = []; }
+  }));
+}
 
-  var audioPart = null;
-  for (var i = 0; i < parts.length; i++) {
-    var p = parts[i];
-    if (p && p.inlineData && p.inlineData.mimeType && p.inlineData.data) {
-      var mt = String(p.inlineData.mimeType);
-      if (mt.indexOf("audio/") === 0) {
-        audioPart = p;
-        break;
-      }
-    }
-  }
-
-  if (!audioPart) {
-    // 返回 502 + 原始 JSON，帮助定位为何没有音频
-    return new Response(JSON.stringify(js), fixCors({ headers: { "Content-Type": "application/json" }, status: 502 }));
-  }
-
-  // 6) 返回音频（默认二进制；也支持 JSON base64）
-  var dataB64 = String(audioPart.inlineData.data || "");
-  var audioMime = String(audioPart.inlineData.mimeType || defaultMime);
-
-  if (req && (req.return_json === true || req.return === "json")) {
-    var out = { mimeType: audioMime, data: dataB64, model: model };
-    return new Response(JSON.stringify(out), fixCors({ headers: { "Content-Type": "application/json" }, status: 200 }));
-  }
-
-  var binary = Buffer.from(dataB64, "base64");
-  return new Response(binary, fixCors({ headers: { "Content-Type": audioMime }, status: 200 }));
+function createWavHeader(pcmBuffer, sampleRate = 24000, channels = 1, bitsPerSample = 16) {
+  const dataSize = pcmBuffer.length;
+  const fileSize = 44 + dataSize - 8;
+  const byteRate = sampleRate * channels * bitsPerSample / 8;
+  const blockAlign = channels * bitsPerSample / 8;
+  
+  const header = Buffer.alloc(44);
+  let offset = 0;
+  
+  header.write('RIFF', offset); offset += 4;
+  header.writeUInt32LE(fileSize, offset); offset += 4;
+  header.write('WAVE', offset); offset += 4;
+  
+  header.write('fmt ', offset); offset += 4;
+  header.writeUInt32LE(16, offset); offset += 4;
+  header.writeUInt16LE(1, offset); offset += 2;
+  header.writeUInt16LE(channels, offset); offset += 2;
+  header.writeUInt32LE(sampleRate, offset); offset += 4;
+  header.writeUInt32LE(byteRate, offset); offset += 4;
+  header.writeUInt16LE(blockAlign, offset); offset += 2;
+  header.writeUInt16LE(bitsPerSample, offset); offset += 2;
+  
+  header.write('data', offset); offset += 4;
+  header.writeUInt32LE(dataSize, offset); offset += 4;
+  
+  return Buffer.concat([header, pcmBuffer]);
 }
 
 const DEFAULT_EMBEDDINGS_MODEL = "text-embedding-004";
