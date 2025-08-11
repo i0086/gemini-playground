@@ -95,6 +95,7 @@ async function handleRequest(req: Request): Promise<Response> {
 
   if (url.pathname.endsWith("/chat/completions") ||
       url.pathname.endsWith("/embeddings") ||
+			url.pathname.endsWith("/generate") ||
       url.pathname.endsWith("/models")) {
     return handleAPIRequest(req);
   }
