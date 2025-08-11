@@ -140,9 +140,10 @@ async function handleAudioGenerate (req, apiKey) {
     contents = [{ role: "user", parts: [{ text: prompt }] }];
   }
 
-  var genCfg = transformConfig(req); // 复用已有文本参数映射（不会覆盖下方音频关键字段）
+  var genCfg = transformConfig(req) || {};
+  // 若上游带了 response_format 等，transformConfig 可能已设置文本类 MIME，必须移除
+  if ("responseMimeType" in genCfg) { delete genCfg.responseMimeType; }
   genCfg.responseModalities = ["AUDIO"];
-  genCfg.responseMimeType = mime;
   genCfg.speechConfig = {
     voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName } }
   };
