@@ -104,90 +104,111 @@ async function handleModels (apiKey) {
 }
 
 async function handleAudioGenerate (req, apiKey) {
-  // 默认使用 TTS 能力模型
-  let model = "gemini-2.5-flash-preview-tts";
-  switch(true) {
-    case typeof req.model !== "string":
-      break;
-    case req.model.startsWith("models/"):
+  // 1) 选择模型（默认 TTS）
+  var model = "gemini-2.5-flash-preview-tts";
+  if (typeof req.model === "string") {
+    if (req.model.indexOf("models/") === 0) {
       model = req.model.substring(7);
-      break;
-    case req.model.startsWith("gemini-"):
-    case req.model.startsWith("learnlm-"):
+    } else if (req.model.indexOf("gemini-") === 0 || req.model.indexOf("learnlm-") === 0) {
       model = req.model;
+    }
   }
 
-  // 音频输出格式
-  const format = (req.audio?.format || "mp3").toLowerCase();
-  const mime = format === "mp3" ? "audio/mpeg" : `audio/${format}`;
+  // 2) 输出格式与语音
+  var format = (req.audio && req.audio.format ? String(req.audio.format) : "mp3").toLowerCase();
+  var mime = format === "mp3" ? "audio/mpeg" : ("audio/" + format);
+  var voiceName = "Kore";
+  if (req.voice) {
+    if (req.voice.voiceName) { voiceName = String(req.voice.voiceName); }
+    else if (req.voice.name) { voiceName = String(req.voice.name); }
+    else if (req.voice.prebuiltVoice) { voiceName = String(req.voice.prebuiltVoice); }
+  }
 
-  // 语音选择：优先从 voice 对象提取
-  const voiceName =
-    req.voice?.voiceName ||
-    req.voice?.name ||
-    req.voice?.prebuiltVoice ||
-    "Kore";
-
-  // 构造 messages：优先支持 OpenAI-style messages（与现有 transform 兼容），否则走 prompt 字段
-  let system_instruction, contents;
+  // 3) 构造内容：优先 messages，否则使用 prompt
+  var transformed = null;
+  var system_instruction;
+  var contents;
   if (Array.isArray(req.messages)) {
-    ({ system_instruction, contents } = await transformMessages(req));
+    transformed = await transformMessages(req);
+    system_instruction = transformed && transformed.system_instruction;
+    contents = transformed && transformed.contents;
   } else {
-    const prompt = (req.prompt || "").toString();
+    var prompt = (req.prompt || "").toString();
     if (!prompt) {
       throw new HttpError("prompt or messages is required", 400);
     }
     contents = [{ role: "user", parts: [{ text: prompt }] }];
   }
 
-  const body = {
-    ...(system_instruction ? { system_instruction } : {}),
-    contents,
-    safetySettings,
-    generationConfig: {
-      // 无论是否传了其他文本参数，都强制音频输出
-      responseModalities: ["AUDIO"],
-      responseMimeType: mime,
-      speechConfig: {
-        voiceConfig: { prebuiltVoiceConfig: { voiceName } }
-      },
-      // 同时兼容已有文本生成参数（如温度/停用词等），但不会覆盖上面的音频关键字段
-      ...transformConfig(req),
-    },
+  var genCfg = transformConfig(req); // 复用已有文本参数映射（不会覆盖下方音频关键字段）
+  genCfg.responseModalities = ["AUDIO"];
+  genCfg.responseMimeType = mime;
+  genCfg.speechConfig = {
+    voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName } }
   };
 
-  const url = `${BASE_URL}/${API_VERSION}/models/${model}:generateContent`;
-  const response = await fetch(url, {
+  var payload = {
+    safetySettings: safetySettings,
+    generationConfig: genCfg,
+    contents: contents
+  };
+  if (system_instruction) {
+    payload.system_instruction = system_instruction;
+  }
+
+  var url = BASE_URL + "/" + API_VERSION + "/models/" + model + ":generateContent";
+  var response = await fetch(url, {
     method: "POST",
     headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
-    body: JSON.stringify(body),
+    body: JSON.stringify(payload),
   });
 
-  // 非 2xx：按原样转发文本错误
   if (!response.ok) {
+    // 直接转发错误文本
     return new Response(await response.text(), fixCors(response));
   }
 
-  // 解析返回，抽取 inlineData 音频
-  const js = JSON.parse(await response.text());
-  const parts = js?.candidates?.[0]?.content?.parts || [];
-  const audioPart = parts.find(p => p.inlineData && /^audio\\//.test(p.inlineData.mimeType || ""));
+  // 4) 提取音频 inlineData（不使用可选链）
+  var textBody = await response.text();
+  var js;
+  try { js = JSON.parse(textBody); } catch (e) {
+    // 返回原始内容帮助诊断
+    return new Response(textBody, fixCors({ headers: { "Content-Type": "application/json" }, status: 200 }));
+  }
+  var parts = [];
+  try {
+    if (js && js.candidates && js.candidates[0] && js.candidates[0].content && js.candidates[0].content.parts) {
+      parts = js.candidates[0].content.parts;
+    }
+  } catch (e) { parts = []; }
+
+  var audioPart = null;
+  for (var i = 0; i < parts.length; i++) {
+    var p = parts[i];
+    if (p && p.inlineData && p.inlineData.mimeType) {
+      var mt = String(p.inlineData.mimeType);
+      if (mt.indexOf("audio/") === 0) {
+        audioPart = p;
+        break;
+      }
+    }
+  }
+
   if (!audioPart) {
-    // 若没有音频，回传原始 JSON 以便诊断
+    // 可选：返回 JSON，帮助排查为何没有音频
     return new Response(JSON.stringify(js), fixCors({ headers: { "Content-Type": "application/json" }, status: 200 }));
   }
 
-  const dataB64 = audioPart.inlineData.data;
-  const audioMime = audioPart.inlineData.mimeType || mime;
+  // 5) 返回音频（默认二进制；支持可选 JSON base64 返回）
+  var dataB64 = audioPart.inlineData && audioPart.inlineData.data ? String(audioPart.inlineData.data) : "";
+  var audioMime = audioPart.inlineData && audioPart.inlineData.mimeType ? String(audioPart.inlineData.mimeType) : mime;
 
-  // 支持返回 JSON base64（可选）
-  if (req.return_json === true || req.return === "json") {
-    const out = { mimeType: audioMime, data: dataB64, model };
+  if (req && (req.return_json === true || req.return === "json")) {
+    var out = { mimeType: audioMime, data: dataB64, model: model };
     return new Response(JSON.stringify(out), fixCors({ headers: { "Content-Type": "application/json" }, status: 200 }));
   }
 
-  // 默认直接返回二进制音频
-  const binary = Buffer.from(dataB64, "base64");
+  var binary = Buffer.from(dataB64, "base64");
   return new Response(binary, fixCors({ headers: { "Content-Type": audioMime }, status: 200 }));
 }
 
