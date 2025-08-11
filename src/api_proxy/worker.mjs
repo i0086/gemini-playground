@@ -35,6 +35,10 @@ export default {
           assert(request.method === "GET");
           return handleModels(apiKey)
             .catch(errHandler);
+				case pathname.endsWith("/audio/generate"):
+				  assert(request.method === "POST");
+				  return handleAudioGenerate(await request.json(), apiKey)
+				    .catch(errHandler);
         default:
           throw new HttpError("404 Not Found", 404);
       }
@@ -97,6 +101,94 @@ async function handleModels (apiKey) {
     }, null, "  ");
   }
   return new Response(body, fixCors(response));
+}
+
+async function handleAudioGenerate (req, apiKey) {
+  // 默认使用 TTS 能力模型
+  let model = "gemini-2.5-flash-preview-tts";
+  switch(true) {
+    case typeof req.model !== "string":
+      break;
+    case req.model.startsWith("models/"):
+      model = req.model.substring(7);
+      break;
+    case req.model.startsWith("gemini-"):
+    case req.model.startsWith("learnlm-"):
+      model = req.model;
+  }
+
+  // 音频输出格式
+  const format = (req.audio?.format || "mp3").toLowerCase();
+  const mime = format === "mp3" ? "audio/mpeg" : `audio/${format}`;
+
+  // 语音选择：优先从 voice 对象提取
+  const voiceName =
+    req.voice?.voiceName ||
+    req.voice?.name ||
+    req.voice?.prebuiltVoice ||
+    "Kore";
+
+  // 构造 messages：优先支持 OpenAI-style messages（与现有 transform 兼容），否则走 prompt 字段
+  let system_instruction, contents;
+  if (Array.isArray(req.messages)) {
+    ({ system_instruction, contents } = await transformMessages(req));
+  } else {
+    const prompt = (req.prompt || "").toString();
+    if (!prompt) {
+      throw new HttpError("prompt or messages is required", 400);
+    }
+    contents = [{ role: "user", parts: [{ text: prompt }] }];
+  }
+
+  const body = {
+    ...(system_instruction ? { system_instruction } : {}),
+    contents,
+    safetySettings,
+    generationConfig: {
+      // 无论是否传了其他文本参数，都强制音频输出
+      responseModalities: ["AUDIO"],
+      responseMimeType: mime,
+      speechConfig: {
+        voiceConfig: { prebuiltVoiceConfig: { voiceName } }
+      },
+      // 同时兼容已有文本生成参数（如温度/停用词等），但不会覆盖上面的音频关键字段
+      ...transformConfig(req),
+    },
+  };
+
+  const url = `${BASE_URL}/${API_VERSION}/models/${model}:generateContent`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
+    body: JSON.stringify(body),
+  });
+
+  // 非 2xx：按原样转发文本错误
+  if (!response.ok) {
+    return new Response(await response.text(), fixCors(response));
+  }
+
+  // 解析返回，抽取 inlineData 音频
+  const js = JSON.parse(await response.text());
+  const parts = js?.candidates?.[0]?.content?.parts || [];
+  const audioPart = parts.find(p => p.inlineData && /^audio\\//.test(p.inlineData.mimeType || ""));
+  if (!audioPart) {
+    // 若没有音频，回传原始 JSON 以便诊断
+    return new Response(JSON.stringify(js), fixCors({ headers: { "Content-Type": "application/json" }, status: 200 }));
+  }
+
+  const dataB64 = audioPart.inlineData.data;
+  const audioMime = audioPart.inlineData.mimeType || mime;
+
+  // 支持返回 JSON base64（可选）
+  if (req.return_json === true || req.return === "json") {
+    const out = { mimeType: audioMime, data: dataB64, model };
+    return new Response(JSON.stringify(out), fixCors({ headers: { "Content-Type": "application/json" }, status: 200 }));
+  }
+
+  // 默认直接返回二进制音频
+  const binary = Buffer.from(dataB64, "base64");
+  return new Response(binary, fixCors({ headers: { "Content-Type": audioMime }, status: 200 }));
 }
 
 const DEFAULT_EMBEDDINGS_MODEL = "text-embedding-004";
