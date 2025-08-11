@@ -129,7 +129,7 @@ async function handleAudioGenerate (req, apiKey) {
   var system_instruction;
   var contents;
   if (Array.isArray(req.messages)) {
-    transformed = await transformMessages(req);
+	transformed = await transformMessages(req.messages);
     system_instruction = transformed && transformed.system_instruction;
     contents = transformed && transformed.contents;
   } else {
@@ -137,13 +137,13 @@ async function handleAudioGenerate (req, apiKey) {
     if (!prompt) {
       throw new HttpError("prompt or messages is required", 400);
     }
-    contents = [{ role: "user", parts: [{ text: prompt }] }];
+	contents = [{ parts: [{ text: prompt }] }];
   }
 
   var genCfg = transformConfig(req) || {};
-  // 若上游带了 response_format 等，transformConfig 可能已设置文本类 MIME，必须移除
-  if ("responseMimeType" in genCfg) { delete genCfg.responseMimeType; }
+  if ("responseMimeType" in genCfg) { delete genCfg.responseMimeType; } // 新增
   genCfg.responseModalities = ["AUDIO"];
+  // genCfg.responseMimeType = mime;  // 这行要删除
   genCfg.speechConfig = {
     voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName } }
   };
