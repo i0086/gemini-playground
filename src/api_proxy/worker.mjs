@@ -140,22 +140,21 @@ async function handleAudioGenerate (req, apiKey) {
 	contents = [{ parts: [{ text: prompt }] }];
   }
 
-  var genCfg = transformConfig(req) || {};
-  if ("responseMimeType" in genCfg) { delete genCfg.responseMimeType; } // 新增
-  genCfg.responseModalities = ["AUDIO"];
-  // genCfg.responseMimeType = mime;  // 这行要删除
-  genCfg.speechConfig = {
-    voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName } }
-  };
-
-  var payload = {
-    safetySettings: safetySettings,
-    generationConfig: genCfg,
-    contents: contents
-  };
-  if (system_instruction) {
-    payload.system_instruction = system_instruction;
-  }
+// 最小 TTS 形态，参考你项目里 util/g_voice.py 的成功示例
+	var payload = {
+	  contents: contents,
+	  generationConfig: {
+	    responseModalities: ["AUDIO"],
+	    speechConfig: {
+	      voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName } }
+	    }
+	  }
+	};
+	// system 指令可选添加，不强制
+	if (system_instruction) {
+	  payload.system_instruction = system_instruction;
+	}
+// 不要添加 safetySettings、不要 merge transformConfig(req)
 
   var url = BASE_URL + "/" + API_VERSION + "/models/" + model + ":generateContent";
   var response = await fetch(url, {
